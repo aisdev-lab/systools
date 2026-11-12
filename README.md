@@ -21,8 +21,29 @@ whenever power consumption goes higher than the threshold or any keyboard activi
 
 **service/gpu-fan-guard.service** systemd service to change speed of AMD GPU
 
+> copy to /etc/systemd/system/gpu-fan-guard.service
+> run `systemctl reload-daemon` and `systemctl enable gpu-fan-guard.service`, `systemctl start gpu-fan-guard.service`
+
 **service/gpu-power-monitor.service** monitor gpu power consumption and run a command
+
+> copy to /etc/systemd/system/gpu-power-monitor.service
+> run `systemctl reload-daemon` and `systemctl enable gpu-power-monitor.service`, `systemctl start gpu-gpu-power.service`
+
 
 ## safe-sleep helper
 
 **profile.d/gpu-activity.sh** monitor keyboard activities in ssh sessions to reset idle timer.
+
+> copy to /etc/profile.d/gpu-activity.sh
+> and add following lines in ~/.bashrc or ~/.profile
+
+```
+# load keyboard command monitor
+if [[ $- == *i* && -n ${SSH_CONNECTION:-} ]] &&
+   [[ -r /etc/profile.d/gpu-activity.sh ]] &&
+   [[ -z ${_GPU_ACTIVITY_HOOK_LOADED:-} ]]; then
+    export _GPU_ACTIVITY_HOOK_LOADED=1
+    source /etc/profile.d/gpu-activity.sh
+fi
+
+``` 
