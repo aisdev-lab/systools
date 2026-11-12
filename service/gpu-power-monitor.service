@@ -1,0 +1,16 @@
+[Unit]
+Description=GPU Power Consumption Monitor
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gpu-power-monitor.sh
+Restart=always
+RestartSec=5
+
+# Ensure clean shutdown
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

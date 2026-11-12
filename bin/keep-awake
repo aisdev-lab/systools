@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RUN_DIR="/run/gpu-power-monitor"
+RUN_FILE="${RUN_DIR}/command-${BASHPID}"
+
+if (($# == 0)); then
+    echo "Usage: gpu-run COMMAND [ARGUMENTS...]" >&2
+    exit 2
+fi
+
+mkdir -p "$RUN_DIR"
+
+# Register this launcher instance.
+printf '%s\n' "$BASHPID" > "$RUN_FILE"
+
+cleanup() {
+    rm -f "$RUN_FILE"
+}
+
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Execute the command with its arguments unchanged.
+"$@"

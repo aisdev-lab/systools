@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# RX 7900 XTX fan guard
+#
+# Junction > 64C  -> force fan to 95%
+# Junction <= 60C -> return fan control to AMD driver
+#
+# The 4C gap prevents rapid switching around the threshold.
+
+GPU=0
+TRIGGER_TEMP=64
+RELEASE_TEMP=60
+FAN_LEVEL=75
+POLL_INTERVAL=5
+
+state="auto"
+
+cleanup() {
+    if [[ "$state" == "forced" ]]; then
+        echo
+        echo "$(date '+%F %T') Exiting -> restoring AMD driver fan control"
+        amd-smi reset --gpu "$GPU" --fans
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+while true; do
+    temp=$(rocm-smi --showtemp --json 2>/dev/null |
+        sed -n 's/.*"Temperature (Sensor junction) (C)": "\([0-9.]*\)".*/\1/p')
+
+    if [[ "$temp" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        temp_int=${temp%.*}
+
+        if [[ "$state" == "auto" && "$temp_int" -gt "$TRIGGER_TEMP" ]]; then
+            echo "$(date '+%F %T') Junction ${temp}C -> fan ${FAN_LEVEL}%"
+
+            if echo y | amd-smi set --gpu "$GPU" --fan "$FAN_LEVEL"; then
+                state="forced"
+            else
+                echo "$(date '+%F %T') ERROR: failed to set fan speed"
+            fi
+
+        elif [[ "$state" == "forced" && "$temp_int" -le "$RELEASE_TEMP" ]]; then
+            echo "$(date '+%F %T') Junction ${temp}C -> AMD driver fan control"
+
+            if amd-smi reset --gpu "$GPU" --fans; then
+                state="auto"
+            else
+                echo "$(date '+%F %T') ERROR: failed to reset fan control"
+            fi
+        fi
+    fi
+
+    sleep "$POLL_INTERVAL"
+done

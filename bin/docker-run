@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Defaults
+CONTAINER=""
+COMMAND=""
+STOP=false
+
+# Runtime files on the host
+RUNTIME_DIR="/tmp/docker-run"
+
+# Command arguments
+CMD_ARGS=()
+
+usage() {
+    cat <<'EOF'
+Usage:
+  docker-run --container-name NAME --cmd EXECUTABLE [ARGS...]
+  docker-run --container-name NAME --cmd EXECUTABLE --stop
+
+Examples:
+  docker-run \
+    --container-name sd \
+    --cmd /sd.cpp/bin/sd-server \
+    --diffusion-model '/models/my model.gguf' \
+    --steps 20
+
+  docker-run --container-name sd --cmd /sd.cpp/bin/sd-server --stop
+
+Options:
+  --container-name NAME   Docker container name
+  --cmd EXECUTABLE        Executable path or command name inside container
+  --stop                  Stop the managed process
+  -h, --help              Show this help
+
+Note:
+  --stop must be the final argument when using this syntax.
+  Each container has one managed process/PID file.
+EOF
+}
+
+log() {
+    printf '%s [%s] %s\n' \
+        "$(date -Is)" "$CONTAINER" "$*" >> "$LOG_FILE"
+}
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+# Parse wrapper options and preserve application arguments.
+while (($#)); do
+    case "$1" in
+        --container-name)
+            (($# >= 2)) || die "--container-name requires a value"
+            CONTAINER="$2"
+            shift 2
+            ;;
+        --cmd)
+            (($# >= 2)) || die "--cmd requires an executable"
+            COMMAND="$2"
+            shift 2
+
+            # Remaining arguments belong to the application.
+            # A final --stop is reserved for the wrapper.
+            if (($#)) && [[ "${!#}" == "--stop" ]]; then
+                STOP=true
+                set -- "${@:1:$(($# - 1))}"
+            fi
+
+            CMD_ARGS=("$@")
+            break
+            ;;
+        --stop)
+            STOP=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "Unknown wrapper option: $1"
+            ;;
+    esac
+done
+
+[[ -n "$CONTAINER" ]] || die "Missing --container-name"
+[[ -n "$COMMAND" ]] || die "Missing --cmd"
+
+mkdir -p "$RUNTIME_DIR"
+
+# Container-specific runtime files.
+# Hashing the container name avoids unsafe filename characters.
+CONTAINER_KEY="$(printf '%s' "$CONTAINER" | sha256sum | cut -c1-16)"
+LOCK_FILE="$RUNTIME_DIR/$CONTAINER_KEY.lock"
+LOG_FILE="$RUNTIME_DIR/$CONTAINER_KEY.log"
+
+# PID file lives inside the container, so a later invocation can find it.
+PID_FILE="/tmp/docker-run-${CONTAINER_KEY}.pid"
+
+acquire_lock() {
+    exec 9>"$LOCK_FILE"
+    flock 9
+}
+
+check_container() {
+    docker inspect "$CONTAINER" >/dev/null 2>&1 ||
+        die "Container '$CONTAINER' does not exist"
+}
+
+check_container_running() {
+    [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" == "true" ]]
+}
+
+stop_process() {
+    acquire_lock
+    log "STOP acquired lock"
+
+    check_container
+
+    if ! check_container_running; then
+        log "STOP container is not running"
+        return 0
+    fi
+
+    if ! docker exec "$CONTAINER" /bin/bash -lc '
+        pidfile="$1"
+
+        if [[ ! -s "$pidfile" ]]; then
+            echo "No managed PID file found"
+            exit 0
+        fi
+
+        pid="$(cat "$pidfile")"
+
+        if [[ ! "$pid" =~ ^[0-9]+$ ]] || ! kill -0 "$pid" 2>/dev/null; then
+            echo "Managed process is not running; removing stale PID file"
+            rm -f "$pidfile"
+            exit 0
+        fi
+
+        echo "Sending TERM to PID $pid"
+        kill -TERM "$pid" 2>/dev/null || true
+
+        for i in $(seq 1 30); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "Process exited gracefully"
+                rm -f "$pidfile"
+                exit 0
+            fi
+            sleep 0.5
+        done
+
+        echo "Process did not exit; sending KILL"
+        kill -KILL "$pid" 2>/dev/null || true
+
+        for i in $(seq 1 10); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "Process exited after KILL"
+                rm -f "$pidfile"
+                exit 0
+            fi
+            sleep 0.5
+        done
+
+        echo "ERROR: Process still appears to exist" >&2
+        exit 1
+    ' docker-run-stop "$PID_FILE" >> "$LOG_FILE" 2>&1; then
+        log "STOP failed"
+        return 1
+    fi
+
+    log "STOP completed"
+}
+
+
+start_process() {
+    acquire_lock
+    log "START acquired lock"
+
+    check_container
+
+    if ! check_container_running; then
+        log "START starting container"
+        docker start "$CONTAINER" >/dev/null
+    fi
+
+    log "START launching: $COMMAND"
+
+    docker exec "$CONTAINER" /bin/bash -lc '
+        set -u
+
+        pidfile="$1"
+        shift
+
+        # Check for an existing managed process.
+        if [[ -s "$pidfile" ]]; then
+            oldpid="$(cat "$pidfile")"
+
+            if [[ "$oldpid" =~ ^[0-9]+$ ]] &&
+               kill -0 "$oldpid" 2>/dev/null; then
+                echo "A managed process is already running (PID $oldpid)" >&2
+                exit 1
+            fi
+
+            echo "Removing stale PID file"
+            rm -f "$pidfile"
+        fi
+
+        # Start the command.
+        "$@" &
+        pid=$!
+
+        printf "%s\n" "$pid" > "$pidfile"
+
+        # Clean up the PID file when this shell exits.
+        cleanup() {
+            if [[ -s "$pidfile" ]] &&
+               [[ "$(cat "$pidfile")" == "$pid" ]]; then
+                rm -f "$pidfile"
+            fi
+        }
+
+        trap cleanup EXIT
+
+        echo "Started managed process PID $pid"
+
+        set +e
+        wait "$pid"
+        rc=$?
+        set -e
+
+        echo "Managed process exited with status $rc"
+        exit "$rc"
+    ' docker-run-start "$PID_FILE" "$COMMAND" "${CMD_ARGS[@]}" 9>&- &
+
+    SERVER_EXEC_PID=$!
+    STARTED=false
+
+    # Wait for the managed process to start.
+    for i in $(seq 1 120); do
+        if ! kill -0 "$SERVER_EXEC_PID" 2>/dev/null; then
+            set +e
+            wait "$SERVER_EXEC_PID"
+            rc=$?
+            set -e
+
+            # Remove any stale PID file after startup failure.
+            docker exec "$CONTAINER" rm -f "$PID_FILE" \
+                >/dev/null 2>&1 || true
+
+            log "START exited before confirmation; rc=$rc"
+            return "$rc"
+        fi
+
+        if docker exec "$CONTAINER" /bin/bash -lc '
+            pidfile="$1"
+
+            [[ -s "$pidfile" ]] || exit 1
+            pid="$(cat "$pidfile")"
+
+            [[ "$pid" =~ ^[0-9]+$ ]] &&
+                kill -0 "$pid" 2>/dev/null
+        ' sd-run-confirm "$PID_FILE" >/dev/null 2>&1; then
+            STARTED=true
+            log "START process confirmed after $i checks"
+            break
+        fi
+
+        sleep 0.25
+    done
+
+    if [[ "$STARTED" != "true" ]]; then
+        log "START timed out waiting for process confirmation"
+
+        kill "$SERVER_EXEC_PID" 2>/dev/null || true
+
+        set +e
+        wait "$SERVER_EXEC_PID"
+        set -e
+
+        # Ensure a failed launch doesn't block the next attempt.
+        docker exec "$CONTAINER" rm -f "$PID_FILE" \
+            >/dev/null 2>&1 || true
+
+        return 1
+    fi
+
+    # Release the lock once startup has been confirmed.
+    exec 9>&-
+    log "START released lock; waiting for process"
+
+    set +e
+    wait "$SERVER_EXEC_PID"
+    rc=$?
+    set -e
+
+    # Final cleanup in case the container-side cleanup didn't run.
+    docker exec "$CONTAINER" rm -f "$PID_FILE" \
+        >/dev/null 2>&1 || true
+
+    log "START process exited; rc=$rc"
+    return "$rc"
+}
+
+log "Invocation received; stop=$STOP; command=$COMMAND"
+
+if [[ "$STOP" == "true" ]]; then
+    stop_process
+else
+    start_process
+fi

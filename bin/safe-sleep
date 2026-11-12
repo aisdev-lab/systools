@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LLAMA_SWAP_URL="${LLAMA_SWAP_URL:-http://127.0.0.1:8080}"
+TIMEOUT=180
+INTERVAL=2
+STEPS=4
+
+# Parse arguments
+AUTO_CONFIRM=false
+
+while getopts ":y" opt; do
+    case "$opt" in
+        y) AUTO_CONFIRM=true ;;
+        *)
+            echo "Usage: $0 [-y]"
+            exit 1
+            ;;
+    esac
+done
+
+echo "===================================="
+echo "  Prepare AI workstation for sleep"
+echo "===================================="
+
+# Check llama-swap availability
+if ! curl -fsS "$LLAMA_SWAP_URL/health" >/dev/null; then
+    echo "ERROR: llama-swap is not responding."
+    exit 1
+fi
+
+# Request unloading of all models
+echo
+echo "[1/$STEPS] Requesting unload of all models..."
+
+if ! curl -fsS -X POST \
+    "$LLAMA_SWAP_URL/api/models/unload"; then
+    echo
+    echo "ERROR: Failed to request model unloading."
+    exit 1
+fi
+
+echo
+echo
+echo "[2/$STEPS] Waiting for models to stop..."
+
+elapsed=0
+running_count=-1
+
+while (( elapsed < TIMEOUT )); do
+    response=$(curl -fsS "$LLAMA_SWAP_URL/running") || {
+        echo "ERROR: Cannot query running models."
+        exit 1
+    }
+
+    running_count=$(printf '%s' "$response" | jq -er '.running | length') || {
+        echo "ERROR: Invalid JSON response from /running."
+        exit 1
+    }
+
+    if (( running_count == 0 )); then
+        echo "No running models remain."
+        break
+    fi
+
+    echo "Still waiting for $running_count running model(s) (${elapsed}s)..."
+    sleep "$INTERVAL"
+    elapsed=$((elapsed + INTERVAL))
+done
+
+if (( running_count != 0 )); then
+    echo "ERROR: Timed out waiting for models to stop."
+    echo "The computer will NOT be suspended."
+    exit 1
+fi
+
+echo
+echo "[3/$STEPS] All models unloaded successfully."
+
+echo
+echo "[4/$STEPS] Check and kill process is still running on gpu..."
+TIMEOUT=10
+INTERVAL=0.5
+
+if command -v amd-smi >/dev/null 2>&1; then
+    GPU_TOOL=amd-smi
+elif command -v rocm-smi >/dev/null 2>&1; then
+    GPU_TOOL=rocm-smi
+else
+    echo "ERROR: Neither amd-smi nor rocm-smi is available." >&2
+    exit 1
+fi
+
+get_gpu_pids() {
+    local output
+
+    if [[ "$GPU_TOOL" == amd-smi ]]; then
+        output=$(amd-smi process --general 2>/dev/null) || return 1
+        printf '%s\n' "$output" |
+            awk '/PID:/ && $2 ~ /^[0-9]+$/ { print $2 }' |
+            sort -un
+    else
+        output=$(rocm-smi --showpids 2>/dev/null) || return 1
+        printf '%s\n' "$output" |
+            awk '/^[[:space:]]*[0-9]+[[:space:]]/ { print $1 }' |
+            sort -un
+    fi
+}
+
+get_entry_pid() {
+    local pid="$1"
+    local ppid pgid parent_pgid
+
+    read -r ppid pgid < <(
+        ps -o ppid=,pgid= -p "$pid" 2>/dev/null
+    ) || return 1
+
+    [[ -n "$ppid" && -n "$pgid" ]] || return 1
+
+    while (( ppid > 1 )); do
+        read -r parent_pgid < <(
+            ps -o pgid= -p "$ppid" 2>/dev/null
+        ) || break
+
+        [[ -n "$parent_pgid" && "$parent_pgid" == "$pgid" ]] ||
+            break
+
+        pid="$ppid"
+
+        read -r ppid < <(
+            ps -o ppid= -p "$pid" 2>/dev/null
+        ) || break
+    done
+
+    echo "$pid"
+}
+
+is_alive() {
+    local state
+
+    state=$(ps -o stat= -p "$1" 2>/dev/null) || return 1
+    [[ -n "$state" && "$state" != *Z* ]]
+}
+
+echo "Using GPU utility: $GPU_TOOL"
+
+pids=$(get_gpu_pids) || {
+    echo "ERROR: Cannot query GPU processes." >&2
+    exit 1
+}
+
+if [[ -z "$pids" ]]; then
+    echo "No GPU processes found."
+else
+
+	declare -A targets=()
+
+	echo "GPU processes:"
+	while read -r pid; do
+	    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+
+	    entry=$(get_entry_pid "$pid") || {
+	        echo "WARNING: Cannot identify entry process for PID $pid."
+	        continue
+	    }
+
+	    targets["$entry"]=1
+	    printf '  GPU PID: %s -> Entry PID: %s\n' "$pid" "$entry"
+	done <<< "$pids"
+
+	if (( ${#targets[@]} == 0 )); then
+	    echo "ERROR: No safe entry processes identified." >&2
+	    exit 1
+	fi
+
+	for pid in "${!targets[@]}"; do
+	    echo "Sending SIGTERM to entry PID $pid..."
+	    kill -TERM "$pid" 2>/dev/null || true
+	done
+
+	deadline=$((SECONDS + TIMEOUT))
+
+	while (( SECONDS < deadline )); do
+	    remaining=0
+
+	    for pid in "${!targets[@]}"; do
+	        if is_alive "$pid"; then
+	            remaining=1
+	            break
+	        fi
+	    done
+
+	    (( remaining == 0 )) && break
+	    sleep "$INTERVAL"
+	done
+
+	for pid in "${!targets[@]}"; do
+	    if is_alive "$pid"; then
+	        echo "Timeout: sending SIGKILL to PID $pid..."
+	        kill -KILL "$pid" 2>/dev/null || true
+	    fi
+	done
+
+	sleep 1
+
+	remaining=$(get_gpu_pids) || {
+	    echo "ERROR: Final GPU verification failed." >&2
+	    exit 1
+	}
+
+	if [[ -z "$remaining" ]]; then
+	    echo "SUCCESS: No GPU processes reported."
+	else
+		echo "ERROR: GPU processes remain:"
+		printf '  PID %s\n' $remaining
+		exit 2
+	fi
+
+fi
+
+# comfirm and sleep
+if [[ "$AUTO_CONFIRM" == false ]]; then
+    echo
+    read -r -p "Suspend this computer now? [y/N] " answer
+
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        echo "Cancelled. The computer will remain awake."
+        exit 0
+    fi
+fi
+
+echo "Suspending computer..."
+
+echo "enter sleep on: $(date)..." > /tmp/safe-sleep.log
+
+systemctl hybrid-sleep

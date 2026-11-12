@@ -1,0 +1,15 @@
+[Unit]
+Description=RX 7900 XTX temperature-based fan guard
+After=rocm-power-limit.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/gpu-fan-guard
+Restart=on-failure
+RestartSec=10
+
+# Give the service enough time to cleanly restore driver fan control
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
